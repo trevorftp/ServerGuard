@@ -133,17 +133,20 @@ public class EntityDecoys : IDisposable
             {
                 despawnAll(entry.Key, entry.Value);
                 disconnected.Add(entry.Key);
-                continue;
             }
-            refresh(entry.Key, entry.Value, now);
         }
         foreach (ConnectedClient client in disconnected) clients.Remove(client);
-        if (connected.Count > 0 && ActiveCount < maxTotal)
+        if (connected.Count > 0)
         {
             if (cursor >= connected.Count) cursor = 0;
+            for (int i = 0; i < connected.Count; i++)
+            {
+                ConnectedClient recipient = connected[(cursor + i) % connected.Count];
+                refresh(recipient, clients[recipient], now);
+            }
             ConnectedClient client = connected[cursor++];
             List<Decoy> decoys = clients[client];
-            if (decoys.Count < config.EntityDecoysPerPlayer) trySpawn(client, decoys, now);
+            if (ActiveCount < maxTotal && decoys.Count < config.EntityDecoysPerPlayer) trySpawn(client, decoys, now);
         }
         ServerMain.FrameProfiler.Mark("serverguard-decoys");
     }
@@ -156,7 +159,7 @@ public class EntityDecoys : IDisposable
             Decoy decoy = decoys[i];
             EntityAgent entity = decoy.Entity;
             scratch.SetAndCorrectDimension((int)Math.Floor(entity.Pos.X), (int)Math.Floor(entity.Pos.InternalY), (int)Math.Floor(entity.Pos.Z));
-            if (now >= decoy.Expires || !inRange(client, entity.Pos) || !hasSpace(client, scratch, decoy.Template) || visibility.CanSee(client, entity, false))
+            if (now >= decoy.Expires || !inRange(client, entity.Pos) || !hasSpace(client, scratch, decoy.Template) || visibility.CanSeeDecoy(client, entity))
             {
                 despawns.Add(new EntityDespawn { EntityId = entity.EntityId, DespawnData = new EntityDespawnData { Reason = EnumDespawnReason.OutOfRange } });
                 decoys.RemoveAt(i);
@@ -237,7 +240,7 @@ public class EntityDecoys : IDisposable
                 scratch.Set(x, (int)Math.Floor(viewer.Y) + 8 - depth, z);
                 scratch.dimension = viewer.Dimension;
                 entity.Pos.SetPos(x + 0.5, scratch.Y, z + 0.5);
-                if (!inRange(client, entity.Pos) || !hasSpace(client, scratch, template) || visibility.CanSee(client, entity, false)) continue;
+                if (!inRange(client, entity.Pos) || !hasSpace(client, scratch, template) || visibility.CanSeeDecoy(client, entity)) continue;
                 bool occupied = false;
                 foreach (Decoy existing in decoys)
                 {

@@ -1,4 +1,4 @@
-﻿# ServerGuard
+# ServerGuard
 
 ServerGuard conceals fully enclosed ore before chunk data reaches clients and mixes ore decoys into the surrounding host rocks. It also filters occluded non-player entities through native tracking and can send optional creature decoys.
 
@@ -29,7 +29,7 @@ Optional [Integrated Mod Manager (IMM)](https://mods.vintagestory.at/imm) suppor
   Entities within this distance remain visible. Accepts 8 to 64 blocks.
 
 - **EntityRayBudgetPerThread: 512**  
-  Visibility raycasts allowed per thread every 200 ms. Accepts 16 to 16384.
+  Real-entity visibility raycasts allowed per thread every 200 ms. Accepts 16 to 16384. Decoys have a separate allowance of this value, capped at 512.
 
 - **EntityDecoysPerPlayer: 8**  
   Target creature decoys per player. Accepts 0 to 16. Set to 0 to disable.

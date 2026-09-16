@@ -47,7 +47,7 @@ public class BlockVisibility
         public readonly (int X, int Y, int Z) Key = key;
         public readonly byte[] Original = original;
         public readonly byte[] Masked = masked;
-        public long Bytes => Original.LongLength + Masked.LongLength;
+        public long Bytes => Original.LongLength + (ReferenceEquals(Original, Masked) ? 0 : Masked.LongLength);
     }
 
     public BlockVisibility(ServerMain server, ServerGuardConfig config, BlockPalette palette)
@@ -90,7 +90,11 @@ public class BlockVisibility
                 hasHost = true;
                 break;
             }
-            if (!hasHost) return;
+            if (!hasHost)
+            {
+                addToCache(new CacheEntry(key, packet.Blocks, packet.Blocks));
+                return;
+            }
 
             pos.SetAndCorrectDimension(packet.X, packet.Y, packet.Z);
             neighborPos.Set(pos);
@@ -124,10 +128,7 @@ public class BlockVisibility
                 }
 
                 byte[] masked = ChunkDataLayer.Compress(output, compressionBuffer);
-                CacheEntry entry = new(key, packet.Blocks, masked);
-                cache[key] = cacheOrder.AddLast(entry);
-                cacheBytes += entry.Bytes;
-                while (cacheBytes > config.ChunkCacheMiB * 1024L * 1024 || cache.Count > maxCachedChunks) remove(cacheOrder.First!);
+                addToCache(new CacheEntry(key, packet.Blocks, masked));
                 packet.SetBlocks(masked);
                 ChunksMasked++;
                 BlocksMasked += changed;
@@ -307,6 +308,13 @@ public class BlockVisibility
         cache.Remove(entry.Value.Key);
         cacheOrder.Remove(entry);
         cacheBytes -= entry.Value.Bytes;
+    }
+
+    private void addToCache(CacheEntry entry)
+    {
+        cache[entry.Key] = cacheOrder.AddLast(entry);
+        cacheBytes += entry.Bytes;
+        while (cacheBytes > config.ChunkCacheMiB * 1024L * 1024 || cache.Count > maxCachedChunks) remove(cacheOrder.First!);
     }
 
     public void OnColumnLoaded(IChunkColumnGenerateRequest request, int dimension)

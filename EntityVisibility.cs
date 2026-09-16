@@ -12,6 +12,7 @@ namespace ServerGuard;
 public class EntityVisibility : IDisposable
 {
     private const int visibilityIntervalMs = 200;
+    private const int maxDecoyRays = 512;
     private const int boundsCorners = 1 << 3;
     private const int samplesPerEntity = 1 + boundsCorners;
     private const double boundsMargin = 0.25;
@@ -34,6 +35,7 @@ public class EntityVisibility : IDisposable
         public readonly Dictionary<(int ClientId, long EntityId), bool> Visible = [];
         public long Epoch = -1;
         public int Remaining;
+        public int DecoyRemaining;
     }
 
     private sealed class OcclusionSupplier(IWorldIntersectionSupplier world) : IWorldIntersectionSupplier
@@ -59,7 +61,11 @@ public class EntityVisibility : IDisposable
         workers = new ThreadLocal<VisibilityWorker>(() => new VisibilityWorker(server, palette));
     }
 
-    public bool CanSee(ConnectedClient client, Entity entity, bool useCache = true)
+    public bool CanSee(ConnectedClient client, Entity entity, bool useCache = true) => canSee(client, entity, useCache, false);
+
+    public bool CanSeeDecoy(ConnectedClient client, Entity entity) => canSee(client, entity, false, true);
+
+    private bool canSee(ConnectedClient client, Entity entity, bool useCache, bool decoy)
     {
         if (!config.ConcealEntities || (!config.ConcealPlayers && entity is EntityPlayer)) return true;
         EntityPlayer? viewer = client.Entityplayer;
@@ -78,12 +84,14 @@ public class EntityVisibility : IDisposable
         {
             worker.Epoch = epoch;
             worker.Remaining = config.EntityRayBudgetPerThread;
+            worker.DecoyRemaining = Math.Min(config.EntityRayBudgetPerThread, maxDecoyRays);
             worker.Visible.Clear();
         }
         var key = (client.Id, entity.EntityId);
         bool visible;
         if (useCache && worker.Visible.TryGetValue(key, out visible)) return visible;
-        if (worker.Remaining < samplesPerEntity)
+        ref int remaining = ref (decoy ? ref worker.DecoyRemaining : ref worker.Remaining);
+        if (remaining < samplesPerEntity)
         {
             // Keep ordinary visibility when the ray budget cannot establish occlusion.
             Interlocked.Increment(ref budgetExhaustions);
@@ -92,26 +100,26 @@ public class EntityVisibility : IDisposable
 
         var origin = worker.Ray.origin;
         origin.Set(viewer.Pos.X + viewer.LocalEyePos.X, viewer.Pos.InternalY + viewer.LocalEyePos.Y, viewer.Pos.Z + viewer.LocalEyePos.Z);
-        visible = clearRay(worker, entity.Pos.X + box.MidX, entity.Pos.InternalY + box.MidY, entity.Pos.Z + box.MidZ);
+        visible = clearRay(worker, ref remaining, entity.Pos.X + box.MidX, entity.Pos.InternalY + box.MidY, entity.Pos.Z + box.MidZ);
         for (int corner = 0; corner < boundsCorners && !visible; corner++)
         {
             double x = (corner & 1) == 0 ? box.X1 - boundsMargin : box.X2 + boundsMargin;
             double y = (corner & 2) == 0 ? box.Y1 - boundsMargin : box.Y2 + boundsMargin;
             double z = (corner & 4) == 0 ? box.Z1 - boundsMargin : box.Z2 + boundsMargin;
-            visible = clearRay(worker, entity.Pos.X + x, entity.Pos.InternalY + y, entity.Pos.Z + z);
+            visible = clearRay(worker, ref remaining, entity.Pos.X + x, entity.Pos.InternalY + y, entity.Pos.Z + z);
         }
         if (useCache) worker.Visible[key] = visible;
         if (!visible) Interlocked.Increment(ref concealed);
         return visible;
     }
 
-    private bool clearRay(VisibilityWorker worker, double x, double y, double z)
+    private bool clearRay(VisibilityWorker worker, ref int remaining, double x, double y, double z)
     {
         var ray = worker.Ray;
         ray.dir.Set(x - ray.origin.X, y - ray.origin.Y, z - ray.origin.Z);
         float distance = (float)ray.dir.Length();
         worker.Raycaster.LoadRayAndPos(ray);
-        worker.Remaining--;
+        remaining--;
         Interlocked.Increment(ref rays);
         return worker.Raycaster.GetSelectedBlock(distance, worker.Filter) == null;
     }
