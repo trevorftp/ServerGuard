@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Config;
+using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.Server;
@@ -18,6 +20,7 @@ public class ServerGuardModSystem : ModSystem
     private BlockVisibility blocks = null!;
     private EntityVisibility entities = null!;
     private InventoryVisibility inventory = null!;
+    private ContainerVisibility containers = null!;
     private EntityDecoys? decoys;
     private AccessTools.FieldRef<ChunkColumnLoadRequest, int> getDimension = null!;
     private Harmony harmony = null!;
@@ -39,7 +42,8 @@ public class ServerGuardModSystem : ModSystem
         blocks = new BlockVisibility(server, config, palette);
         getDimension = AccessTools.FieldRefAccess<ChunkColumnLoadRequest, int>("dimension");
         entities = new EntityVisibility(server, config, palette);
-        inventory = new InventoryVisibility(config);
+        inventory = new InventoryVisibility(config, entities);
+        containers = new ContainerVisibility(config);
         harmony = new Harmony(harmonyId);
         try
         {
@@ -50,6 +54,10 @@ public class ServerGuardModSystem : ModSystem
             patch(typeof(PhysicsManager), "PrepareEntitySpawns", [typeof(Entity[]), typeof(List<ConnectedClient>)], nameof(afterSpawns), false);
             patch(typeof(PhysicsManager), "SendPrioritySpawn", [typeof(Entity), typeof(ICollection<ConnectedClient>)], nameof(beforePrioritySpawn), true);
             patch(typeof(ServerWorldPlayerData), "ToPacketForOtherPlayers", [typeof(IServerPlayer)], nameof(afterPlayerData), false);
+            patch(typeof(ServerMain), "BroadcastPlayerData", [typeof(IServerPlayer), typeof(bool), typeof(bool)], nameof(beforeBroadcastPlayerData), true);
+            patch(typeof(ServerMain), "SendInitialPlayerDataForOthers", [typeof(IServerPlayer), typeof(IServerPlayer), typeof(FastMemoryStream)], nameof(beforeInitialPlayerData), true);
+            patch(typeof(ServerPackets), "getBlockEntityPacket", [typeof(BlockEntity), typeof(string), typeof(FastMemoryStream), typeof(BinaryWriter)], nameof(afterBlockEntityPacket), false);
+            patch(typeof(ServerSystemBlockSimulation), "BlockEntityToPacket", [typeof(BlockEntity), typeof(FastMemoryStream)], nameof(afterBlockEntityPacket), false);
             patch(typeof(ServerMain).Assembly.GetType("Vintagestory.Server.ServerSystemSupplyChunks", true)!, "mainThreadLoadChunkColumn", [typeof(ChunkColumnLoadRequest)], nameof(afterColumnLoaded), false);
             api.ChatCommands.Create("serverguard")
                 .WithDescription(Lang.Get("serverguard:command-description"))
@@ -80,12 +88,31 @@ public class ServerGuardModSystem : ModSystem
     {
         if (!ReferenceEquals(active, this)) return TextCommandResult.Error(Lang.Get("serverguard:inactive"));
         return TextCommandResult.Success(Lang.Get("serverguard:status",
-            config.ConcealOre, config.ConcealEntities, blocks.ChunksMasked, blocks.CacheHits, blocks.CacheBytes, blocks.BlocksMasked, entities.Rays, entities.Concealed, entities.BudgetExhaustions, decoys?.ActiveCount ?? 0, decoys?.Spawned ?? 0, config.ConcealEntities && config.ConcealPlayers, config.ConcealPlayerInventory, inventory.Redacted));
+            config.ConcealOre, config.ConcealEntities, blocks.ChunksMasked, blocks.CacheHits, blocks.CacheBytes, blocks.BlocksMasked, entities.Rays, entities.Concealed, entities.BudgetExhaustions, decoys?.ActiveCount ?? 0, decoys?.Spawned ?? 0, config.ConcealEntities && config.ConcealPlayers, config.ConcealPlayerInventory, inventory.Redacted, config.ConcealContainers, containers.Redacted));
     }
 
     private static void afterChunk(Packet_ServerChunk __result) => active?.blocks.MaskChunk(__result);
 
     private static void afterPlayerData(Packet_Server __result) => active?.inventory.Mask(__result);
+
+    private static void afterBlockEntityPacket(BlockEntity blockEntity, Packet_BlockEntity __result) => active?.containers.Mask(blockEntity, __result);
+
+    private static bool beforeBroadcastPlayerData(ServerMain __instance, IServerPlayer owningPlayer, bool sendInventory, bool sendPrivileges)
+    {
+        ServerGuardModSystem? guard = active;
+        if (guard?.config.ConcealEntities != true || !guard.config.ConcealPlayers) return true;
+        ServerWorldPlayerData data = (ServerWorldPlayerData)owningPlayer.WorldData;
+        __instance.SendPacket(owningPlayer, data.ToPacket(owningPlayer, sendInventory, sendPrivileges));
+        guard.inventory.Broadcast(__instance, owningPlayer, data.ToPacketForOtherPlayers(owningPlayer));
+        return false;
+    }
+
+    private static bool beforeInitialPlayerData(ServerMain __instance, IServerPlayer owningPlayer, IServerPlayer toPlayer)
+    {
+        ServerGuardModSystem? guard = active;
+        if (guard?.config.ConcealEntities != true || !guard.config.ConcealPlayers) return true;
+        return guard.inventory.CanSee(__instance.Clients[toPlayer.ClientId], owningPlayer);
+    }
 
     private static void afterColumnLoaded(ChunkColumnLoadRequest chunkRequest)
     {

@@ -13,6 +13,7 @@ public class ServerGuardConfig
     public int EntityRayBudgetPerThread = 512;
     public int EntityDecoysPerPlayer = 8;
     public bool ConcealPlayerInventory = true;
+    public bool ConcealContainers = true;
 
     public void Validate()
     {
