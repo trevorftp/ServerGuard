@@ -12,6 +12,7 @@ public class ServerGuardConfig
     public int AlwaysVisibleRange = 16;
     public int EntityRayBudgetPerThread = 512;
     public int EntityDecoysPerPlayer = 8;
+    public bool ConcealPlayerInventory = true;
 
     public void Validate()
     {

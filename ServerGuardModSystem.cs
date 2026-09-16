@@ -17,6 +17,7 @@ public class ServerGuardModSystem : ModSystem
     private ServerGuardConfig config = null!;
     private BlockVisibility blocks = null!;
     private EntityVisibility entities = null!;
+    private InventoryVisibility inventory = null!;
     private EntityDecoys? decoys;
     private AccessTools.FieldRef<ChunkColumnLoadRequest, int> getDimension = null!;
     private Harmony harmony = null!;
@@ -38,6 +39,7 @@ public class ServerGuardModSystem : ModSystem
         blocks = new BlockVisibility(server, config, palette);
         getDimension = AccessTools.FieldRefAccess<ChunkColumnLoadRequest, int>("dimension");
         entities = new EntityVisibility(server, config, palette);
+        inventory = new InventoryVisibility(config);
         harmony = new Harmony(harmonyId);
         try
         {
@@ -47,6 +49,7 @@ public class ServerGuardModSystem : ModSystem
             patch(typeof(PhysicsManager), "UpdateTrackedEntityState", [typeof(Entity), typeof(List<ConnectedClient>), typeof(int)], nameof(afterTracking), false);
             patch(typeof(PhysicsManager), "PrepareEntitySpawns", [typeof(Entity[]), typeof(List<ConnectedClient>)], nameof(afterSpawns), false);
             patch(typeof(PhysicsManager), "SendPrioritySpawn", [typeof(Entity), typeof(ICollection<ConnectedClient>)], nameof(beforePrioritySpawn), true);
+            patch(typeof(ServerWorldPlayerData), "ToPacketForOtherPlayers", [typeof(IServerPlayer)], nameof(afterPlayerData), false);
             patch(typeof(ServerMain).Assembly.GetType("Vintagestory.Server.ServerSystemSupplyChunks", true)!, "mainThreadLoadChunkColumn", [typeof(ChunkColumnLoadRequest)], nameof(afterColumnLoaded), false);
             api.ChatCommands.Create("serverguard")
                 .WithDescription(Lang.Get("serverguard:command-description"))
@@ -77,10 +80,12 @@ public class ServerGuardModSystem : ModSystem
     {
         if (!ReferenceEquals(active, this)) return TextCommandResult.Error(Lang.Get("serverguard:inactive"));
         return TextCommandResult.Success(Lang.Get("serverguard:status",
-            config.ConcealOre, config.ConcealEntities, blocks.ChunksMasked, blocks.CacheHits, blocks.CacheBytes, blocks.BlocksMasked, entities.Rays, entities.Concealed, entities.BudgetExhaustions, decoys?.ActiveCount ?? 0, decoys?.Spawned ?? 0, config.ConcealEntities && config.ConcealPlayers));
+            config.ConcealOre, config.ConcealEntities, blocks.ChunksMasked, blocks.CacheHits, blocks.CacheBytes, blocks.BlocksMasked, entities.Rays, entities.Concealed, entities.BudgetExhaustions, decoys?.ActiveCount ?? 0, decoys?.Spawned ?? 0, config.ConcealEntities && config.ConcealPlayers, config.ConcealPlayerInventory, inventory.Redacted));
     }
 
     private static void afterChunk(Packet_ServerChunk __result) => active?.blocks.MaskChunk(__result);
+
+    private static void afterPlayerData(Packet_Server __result) => active?.inventory.Mask(__result);
 
     private static void afterColumnLoaded(ChunkColumnLoadRequest chunkRequest)
     {
