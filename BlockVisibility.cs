@@ -20,6 +20,8 @@ public class BlockVisibility
     private const int chunkVolume = chunkSize * chunkSize * chunkSize;
     private const int maxCachedChunks = 4096;
     private const int updateBatchSize = 512;
+    private const int clusterRegionShift = 4;
+    private static readonly (int X, int Y, int Z)[] clusterShapes = [(1, 1, 1), (2, 1, 1), (1, 1, 2), (1, 2, 1), (0, 1, 0), (2, 0, 2)];
     private readonly ServerMain server;
     private readonly ServerGuardConfig config;
     private readonly BlockPalette palette;
@@ -59,6 +61,12 @@ public class BlockVisibility
         output = new ChunkDataLayer(pool);
         unpack = AccessTools.Method(typeof(ChunkData), "UnpackBlocksTo", [typeof(int[]), typeof(byte[]), typeof(byte[]), typeof(int)])
             .CreateDelegate<Action<int[], byte[], byte[], int>>();
+    }
+
+    public void MaskIdentification(Packet_ServerIdentification identification, bool controlServerPrivilege)
+    {
+        // The world seed lets any client recreate deposit positions offline
+        if (config.ConcealOre && !controlServerPrivilege) identification.Seed = 0;
     }
 
     public void MaskChunk(Packet_ServerChunk packet)
@@ -164,8 +172,11 @@ public class BlockVisibility
     {
         int[] variants = palette.Decoys[host];
         if (config.DecoyPercent == 0 || variants.Length == 0) return host;
+        // Coarse noise picks a cluster shape per region so decoy pockets vary between blobs, streaks, and thin seams.
         // Small clusters retain compression and use the same rule for stone and real ore.
-        uint noise = (uint)GameMath.MurmurHash3((x >> 1) ^ salt, y >> 1, z >> 1);
+        uint region = (uint)GameMath.MurmurHash3((x >> clusterRegionShift) ^ salt, y >> clusterRegionShift, z >> clusterRegionShift);
+        var (shiftX, shiftY, shiftZ) = clusterShapes[region % (uint)clusterShapes.Length];
+        uint noise = (uint)GameMath.MurmurHash3((x >> shiftX) ^ salt, y >> shiftY, z >> shiftZ);
         return noise % 100 < config.DecoyPercent ? variants[noise / 100 % (uint)variants.Length] : host;
     }
 

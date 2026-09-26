@@ -14,7 +14,6 @@ namespace ServerGuard;
 public class EntityDecoys : IDisposable
 {
     private const int intervalMs = 250;
-    private const int maxTotal = 64;
     private const int searchColumns = 4;
     private const int searchDepth = 32;
     private const int maxRange = 80;
@@ -35,7 +34,6 @@ public class EntityDecoys : IDisposable
     private readonly BlockPos spacePos = new(Dimensions.NormalWorld);
     private readonly long listenerId;
     private readonly int minRange;
-    private int cursor;
 
     public int ActiveCount { get; private set; }
     public long Spawned { get; private set; }
@@ -112,7 +110,7 @@ public class EntityDecoys : IDisposable
         }
         if (templates.Count == 0) throw new ArgumentException("No supported ServerGuard decoy entity types were registered.");
         listenerId = api.Event.RegisterGameTickListener(onTick, intervalMs);
-        api.Logger.Notification("ServerGuard decoys: {0} creatures per player, {1} creature variants, {2} total cap.", config.EntityDecoysPerPlayer, templates.Count, maxTotal);
+        api.Logger.Notification("ServerGuard decoys: {0} creatures per player, {1} creature variants, {2} total cap.", config.EntityDecoysPerPlayer, templates.Count, config.EntityDecoysGlobalCap);
     }
 
     private void onTick(float dt)
@@ -136,17 +134,11 @@ public class EntityDecoys : IDisposable
             }
         }
         foreach (ConnectedClient client in disconnected) clients.Remove(client);
-        if (connected.Count > 0)
+        foreach (ConnectedClient client in connected)
         {
-            if (cursor >= connected.Count) cursor = 0;
-            for (int i = 0; i < connected.Count; i++)
-            {
-                ConnectedClient recipient = connected[(cursor + i) % connected.Count];
-                refresh(recipient, clients[recipient], now);
-            }
-            ConnectedClient client = connected[cursor++];
             List<Decoy> decoys = clients[client];
-            if (ActiveCount < maxTotal && decoys.Count < config.EntityDecoysPerPlayer) trySpawn(client, decoys, now);
+            refresh(client, decoys, now);
+            if (ActiveCount < config.EntityDecoysGlobalCap && decoys.Count < config.EntityDecoysPerPlayer) trySpawn(client, decoys, now);
         }
         ServerMain.FrameProfiler.Mark("serverguard-decoys");
     }

@@ -29,10 +29,16 @@ Optional [Integrated Mod Manager (IMM)](https://mods.vintagestory.at/imm) suppor
   Entities within this distance remain visible. Accepts 8 to 64 blocks.
 
 - **EntityRayBudgetPerThread: 512**  
-  Real-entity visibility raycasts allowed per thread every 200 ms. Accepts 16 to 16384. Decoys have a separate allowance of this value, capped at 512.
+  Real-entity visibility raycasts allowed per thread every 200 ms. Accepts 16 to 16384.
 
-- **EntityDecoysPerPlayer: 8**  
-  Target creature decoys per player. Accepts 0 to 16. Set to 0 to disable.
+- **DecoyRayBudgetPerThread: 4096**  
+  Decoy visibility raycasts allowed per thread every 200 ms, separate from the real-entity allowance above and unable to spend it. Accepts 16 to 16384.
+
+- **EntityDecoysPerPlayer: 32**  
+  Target creature decoys per player. Accepts 0 to 128. Set to 0 to disable.
+
+- **EntityDecoysGlobalCap: 512**  
+  Total creature decoys allowed across all players at once. Accepts 0 to 4096.
 
 - **ConcealPlayerInventory: true**  
   Redacts other players' hotbar and worn-bag contents from the outgoing player data packet. Worn gear, the active hotbar slot, the skill slot, and the off-hand slot remain visible so rendering is unaffected.

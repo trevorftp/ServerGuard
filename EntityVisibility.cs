@@ -12,7 +12,6 @@ namespace ServerGuard;
 public class EntityVisibility : IDisposable
 {
     private const int visibilityIntervalMs = 200;
-    private const int maxDecoyRays = 512;
     private const int boundsCorners = 1 << 3;
     private const int samplesPerEntity = 1 + boundsCorners;
     private const double boundsMargin = 0.25;
@@ -84,7 +83,7 @@ public class EntityVisibility : IDisposable
         {
             worker.Epoch = epoch;
             worker.Remaining = config.EntityRayBudgetPerThread;
-            worker.DecoyRemaining = Math.Min(config.EntityRayBudgetPerThread, maxDecoyRays);
+            worker.DecoyRemaining = config.DecoyRayBudgetPerThread;
             worker.Visible.Clear();
         }
         var key = (client.Id, entity.EntityId);
@@ -93,9 +92,9 @@ public class EntityVisibility : IDisposable
         ref int remaining = ref (decoy ? ref worker.DecoyRemaining : ref worker.Remaining);
         if (remaining < samplesPerEntity)
         {
-            // Keep ordinary visibility when the ray budget cannot establish occlusion.
+            // Fail toward concealment when the budget cannot establish occlusion: hide an unverified real entity, and pull an unverified decoy.
             Interlocked.Increment(ref budgetExhaustions);
-            return true;
+            return decoy;
         }
 
         var origin = worker.Ray.origin;

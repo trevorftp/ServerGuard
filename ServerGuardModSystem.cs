@@ -59,6 +59,7 @@ public class ServerGuardModSystem : ModSystem
             patch(typeof(ServerPackets), "getBlockEntityPacket", [typeof(BlockEntity), typeof(string), typeof(FastMemoryStream), typeof(BinaryWriter)], nameof(afterBlockEntityPacket), false);
             patch(typeof(ServerSystemBlockSimulation), "BlockEntityToPacket", [typeof(BlockEntity), typeof(FastMemoryStream)], nameof(afterBlockEntityPacket), false);
             patch(typeof(ServerMain).Assembly.GetType("Vintagestory.Server.ServerSystemSupplyChunks", true)!, "mainThreadLoadChunkColumn", [typeof(ChunkColumnLoadRequest)], nameof(afterColumnLoaded), false);
+            patch(typeof(ServerMain), "CreatePacketIdentification", [typeof(bool)], nameof(afterIdentification), false);
             api.ChatCommands.Create("serverguard")
                 .WithDescription(Lang.Get("serverguard:command-description"))
                 .RequiresPrivilege(Privilege.controlserver)
@@ -119,6 +120,8 @@ public class ServerGuardModSystem : ModSystem
         ServerGuardModSystem? guard = active;
         if (guard != null) guard.blocks.OnColumnLoaded(chunkRequest, guard.getDimension(chunkRequest));
     }
+
+    private static void afterIdentification(bool controlServerPrivilege, Packet_Server __result) => active?.blocks.MaskIdentification(__result.Identification, controlServerPrivilege);
 
     private static bool beforeBlocks(List<BlockPos> positions, int packetId)
     {
