@@ -10,6 +10,7 @@ using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.Server;
+using Vintagestory.ServerMods;
 
 namespace ServerGuard;
 
@@ -21,6 +22,7 @@ public class ServerGuardModSystem : ModSystem
     private EntityVisibility entities = null!;
     private InventoryVisibility inventory = null!;
     private ContainerVisibility containers = null!;
+    private DepositSeeding deposits = null!;
     private EntityDecoys? decoys;
     private AccessTools.FieldRef<ChunkColumnLoadRequest, int> getDimension = null!;
     private Harmony harmony = null!;
@@ -44,6 +46,7 @@ public class ServerGuardModSystem : ModSystem
         entities = new EntityVisibility(server, config, palette);
         inventory = new InventoryVisibility(config, entities);
         containers = new ContainerVisibility(config);
+        deposits = new DepositSeeding(api, config);
         harmony = new Harmony(harmonyId);
         try
         {
@@ -60,6 +63,7 @@ public class ServerGuardModSystem : ModSystem
             patch(typeof(ServerSystemBlockSimulation), "BlockEntityToPacket", [typeof(BlockEntity), typeof(FastMemoryStream)], nameof(afterBlockEntityPacket), false);
             patch(typeof(ServerMain).Assembly.GetType("Vintagestory.Server.ServerSystemSupplyChunks", true)!, "mainThreadLoadChunkColumn", [typeof(ChunkColumnLoadRequest)], nameof(afterColumnLoaded), false);
             patch(typeof(ServerMain), "CreatePacketIdentification", [typeof(bool)], nameof(afterIdentification), false);
+            patch(typeof(GenDeposits), "initWorldGen", [], nameof(afterDepositWorldGenInit), false);
             api.ChatCommands.Create("serverguard")
                 .WithDescription(Lang.Get("serverguard:command-description"))
                 .RequiresPrivilege(Privilege.controlserver)
@@ -122,6 +126,8 @@ public class ServerGuardModSystem : ModSystem
     }
 
     private static void afterIdentification(bool controlServerPrivilege, Packet_Server __result) => active?.blocks.MaskIdentification(__result.Identification, controlServerPrivilege);
+
+    private static void afterDepositWorldGenInit(GenDeposits __instance) => active?.deposits.Reseed(__instance);
 
     private static bool beforeBlocks(List<BlockPos> positions, int packetId)
     {
