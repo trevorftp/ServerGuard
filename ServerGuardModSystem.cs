@@ -57,6 +57,7 @@ public class ServerGuardModSystem : ModSystem
             patch(typeof(PhysicsManager), "PrepareEntitySpawns", [typeof(Entity[]), typeof(List<ConnectedClient>)], nameof(afterSpawns), false);
             patch(typeof(PhysicsManager), "SendPrioritySpawn", [typeof(Entity), typeof(ICollection<ConnectedClient>)], nameof(beforePrioritySpawn), true);
             patch(typeof(ServerWorldPlayerData), "ToPacketForOtherPlayers", [typeof(IServerPlayer)], nameof(afterPlayerData), false);
+            patch(typeof(ServerMain), "SendPacket", [typeof(int), typeof(Packet_Server)], nameof(beforeSendPacket), true);
             patch(typeof(ServerMain), "BroadcastPlayerData", [typeof(IServerPlayer), typeof(bool), typeof(bool)], nameof(beforeBroadcastPlayerData), true);
             patch(typeof(ServerMain), "SendInitialPlayerDataForOthers", [typeof(IServerPlayer), typeof(IServerPlayer), typeof(FastMemoryStream)], nameof(beforeInitialPlayerData), true);
             patch(typeof(ServerPackets), "getBlockEntityPacket", [typeof(BlockEntity), typeof(string), typeof(FastMemoryStream), typeof(BinaryWriter)], nameof(afterBlockEntityPacket), false);
@@ -98,7 +99,14 @@ public class ServerGuardModSystem : ModSystem
 
     private static void afterChunk(Packet_ServerChunk __result) => active?.blocks.MaskChunk(__result);
 
-    private static void afterPlayerData(Packet_Server __result) => active?.inventory.Mask(__result);
+    private static void afterPlayerData(IServerPlayer owningPlayer, Packet_Server __result) => active?.inventory.Mask(__result, owningPlayer);
+
+    private static void beforeSendPacket(int clientId, ref Packet_Server packet)
+    {
+        if (packet.Id != Packet_ServerIdEnum.PlayerData) return;
+        ServerGuardModSystem? guard = active;
+        if (guard != null) packet = guard.inventory.GetPacketFor(clientId, packet);
+    }
 
     private static void afterBlockEntityPacket(BlockEntity blockEntity, Packet_BlockEntity __result) => active?.containers.Mask(blockEntity, __result);
 

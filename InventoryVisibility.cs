@@ -1,3 +1,5 @@
+using System;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using Vintagestory.API.Server;
 using Vintagestory.Server;
@@ -10,6 +12,8 @@ public class InventoryVisibility(ServerGuardConfig config, EntityVisibility enti
     private const int hotbarSkillSlot = 10;
     private const int hotbarOffhandSlot = 11;
     private static readonly Packet_ItemStack empty = new() { ItemClass = -1 };
+    [ThreadStatic] private static bool rebuilding;
+    private readonly ConditionalWeakTable<Packet_Server, IServerPlayer> redactedOwners = new();
     private long redacted;
 
     public long Redacted => Interlocked.Read(ref redacted);
@@ -27,11 +31,9 @@ public class InventoryVisibility(ServerGuardConfig config, EntityVisibility enti
         }
     }
 
-    // ToPacketForOtherPlayers never returns a packet to the owning player.
-    // All the calls here are for a different client.
-    public void Mask(Packet_Server packet)
+    public void Mask(Packet_Server packet, IServerPlayer owningPlayer)
     {
-        if (!config.ConcealPlayerInventory) return;
+        if (!config.ConcealPlayerInventory || rebuilding) return;
         foreach (Packet_InventoryContents inventory in packet.PlayerData.InventoryContents)
         {
             switch (inventory.InventoryClass)
@@ -44,7 +46,22 @@ public class InventoryVisibility(ServerGuardConfig config, EntityVisibility enti
                     break;
             }
         }
+        redactedOwners.AddOrUpdate(packet, owningPlayer);
         Interlocked.Increment(ref redacted);
+    }
+
+    public Packet_Server GetPacketFor(int clientId, Packet_Server packet)
+    {
+        if (!redactedOwners.TryGetValue(packet, out IServerPlayer? owner) || owner.ClientId != clientId) return packet;
+        rebuilding = true;
+        try
+        {
+            return ((ServerWorldPlayerData)owner.WorldData).ToPacketForOtherPlayers(owner);
+        }
+        finally
+        {
+            rebuilding = false;
+        }
     }
 
     // Only the active slot and the two always-rendered slots stay visible.
