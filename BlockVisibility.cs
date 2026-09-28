@@ -22,18 +22,23 @@ public class BlockVisibility
     private const int updateBatchSize = 512;
     private const int clusterRegionShift = 4;
     private static readonly (int X, int Y, int Z)[] clusterShapes = [(1, 1, 1), (2, 1, 1), (1, 1, 2), (1, 2, 1), (0, 1, 0), (2, 0, 2)];
+    private static readonly (int X, int Y, int Z)[] secondRing = buildSecondRing();
     private readonly ServerMain server;
     private readonly ServerGuardConfig config;
     private readonly BlockPalette palette;
     private readonly int salt = RandomNumberGenerator.GetInt32(int.MaxValue);
     private readonly object sync = new();
     private readonly int[] source = new int[chunkVolume];
+    private readonly bool[] enclosedCells = new bool[chunkVolume];
     private readonly int[] compressionBuffer = new int[ChunkDataLayer.DATASLICES * ChunkDataLayer.SLICESIZE];
     private readonly ChunkDataPool pool;
     private readonly ChunkDataLayer output;
     private readonly IWorldChunk?[] neighbors = new IWorldChunk?[BlockFacing.NumberOfFaces];
     private readonly BlockPos pos = new(Dimensions.NormalWorld);
     private readonly BlockPos neighborPos = new(Dimensions.NormalWorld);
+    private readonly BlockPos ringPos = new(Dimensions.NormalWorld);
+    // Only valid for one resend. Block changes that bypass these hooks would leave it stale.
+    private readonly Dictionary<(int X, int Y, int Z), bool> knownEnclosure = [];
     private readonly Dictionary<(int X, int Y, int Z), LinkedListNode<CacheEntry>> cache = [];
     private readonly LinkedList<CacheEntry> cacheOrder = [];
     private readonly Action<int[], byte[], byte[], int> unpack;
@@ -123,11 +128,22 @@ public class BlockVisibility
                         for (int x = 0; x < chunkSize; x++)
                         {
                             int index = (y * chunkSize + z) * chunkSize + x;
+                            enclosedCells[index] = palette.IsOpaque(source[index]) && enclosed(x, y, z);
+                        }
+                    }
+                }
+                for (int y = 0; y < chunkSize; y++)
+                {
+                    for (int z = 0; z < chunkSize; z++)
+                    {
+                        for (int x = 0; x < chunkSize; x++)
+                        {
+                            int index = (y * chunkSize + z) * chunkSize + x;
                             int id = source[index];
                             int host = palette.Host[id];
-                            if (host != 0 && enclosed(x, y, z))
+                            if (host != 0 && enclosedCells[index])
                             {
-                                id = replacement(host, packet.X * chunkSize + x, packet.Y * chunkSize + y, packet.Z * chunkSize + z);
+                                id = buried(x, y, z) ? replacement(host, packet.X * chunkSize + x, packet.Y * chunkSize + y, packet.Z * chunkSize + z) : host;
                                 changed++;
                             }
                             output.SetUnsafe(index, id);
@@ -152,17 +168,50 @@ public class BlockVisibility
 
     private bool enclosed(int x, int y, int z)
     {
-        return palette.IsOpaque(read(x - 1, y, z, BlockFacing.WEST))
-            && palette.IsOpaque(read(x + 1, y, z, BlockFacing.EAST))
-            && palette.IsOpaque(read(x, y - 1, z, BlockFacing.DOWN))
-            && palette.IsOpaque(read(x, y + 1, z, BlockFacing.UP))
-            && palette.IsOpaque(read(x, y, z - 1, BlockFacing.NORTH))
-            && palette.IsOpaque(read(x, y, z + 1, BlockFacing.SOUTH));
+        return palette.IsOpaque(read(x - 1, y, z))
+            && palette.IsOpaque(read(x + 1, y, z))
+            && palette.IsOpaque(read(x, y - 1, z))
+            && palette.IsOpaque(read(x, y + 1, z))
+            && palette.IsOpaque(read(x, y, z - 1))
+            && palette.IsOpaque(read(x, y, z + 1));
     }
 
-    private int read(int x, int y, int z, BlockFacing face)
+    // Decoys stay at least two layers from any exposed face.
+    // The client removes a mined block itself before the server can resend the layer behind it.
+    private bool buried(int x, int y, int z)
     {
-        if ((uint)x < chunkSize && (uint)y < chunkSize && (uint)z < chunkSize) return source[(y * chunkSize + z) * chunkSize + x];
+        if (onChunkEdge(x, y, z)) return false;
+        return enclosedAt(x - 1, y, z)
+            && enclosedAt(x + 1, y, z)
+            && enclosedAt(x, y - 1, z)
+            && enclosedAt(x, y + 1, z)
+            && enclosedAt(x, y, z - 1)
+            && enclosedAt(x, y, z + 1);
+    }
+
+    private bool enclosedAt(int x, int y, int z)
+    {
+        if ((uint)x < chunkSize && (uint)y < chunkSize && (uint)z < chunkSize) return enclosedCells[(y * chunkSize + z) * chunkSize + x];
+        return enclosed(x, y, z);
+    }
+
+    // Cells along a chunk edge would need a diagonal chunk for their second ring, so they never hold a decoy.
+    private static bool onChunkEdge(int x, int y, int z)
+    {
+        bool edgeX = (x & chunkMask) is 0 or chunkMask;
+        bool edgeY = (y & chunkMask) is 0 or chunkMask;
+        bool edgeZ = (z & chunkMask) is 0 or chunkMask;
+        return edgeX ? edgeY || edgeZ : edgeY && edgeZ;
+    }
+
+    // Only reaches the six face-adjacent chunks, which onChunkEdge guarantees is enough.
+    private int read(int x, int y, int z)
+    {
+        BlockFacing face;
+        if ((uint)x >= chunkSize) face = x < 0 ? BlockFacing.WEST : BlockFacing.EAST;
+        else if ((uint)y >= chunkSize) face = y < 0 ? BlockFacing.DOWN : BlockFacing.UP;
+        else if ((uint)z >= chunkSize) face = z < 0 ? BlockFacing.NORTH : BlockFacing.SOUTH;
+        else return source[(y * chunkSize + z) * chunkSize + x];
         IWorldChunk? chunk = neighbors[face.Index];
         if (chunk == null || chunk.Disposed) return -1;
         return chunk.UnpackAndReadBlock(((y & chunkMask) * chunkSize + (z & chunkMask)) * chunkSize + (x & chunkMask), BlockLayersAccess.Solid);
@@ -183,14 +232,44 @@ public class BlockVisibility
     private int getView(int id, BlockPos position)
     {
         int host = palette.Host[id];
-        if (host == 0) return id;
+        if (host == 0 || !enclosed(position)) return id;
+        return buried(position) ? replacement(host, position.X, position.InternalY, position.Z) : host;
+    }
+
+    private bool enclosed(BlockPos position)
+    {
+        var key = (position.X, position.InternalY, position.Z);
+        if (knownEnclosure.TryGetValue(key, out bool known)) return known;
+        bool result = true;
         neighborPos.Set(position);
         foreach (BlockFacing face in BlockFacing.ALLFACES)
         {
             face.IterateThruFacingOffsets(neighborPos);
-            if (!palette.IsOpaque(getBlock(neighborPos))) return id;
+            if (palette.IsOpaque(getBlock(neighborPos))) continue;
+            result = false;
+            break;
         }
-        return replacement(host, position.X, position.InternalY, position.Z);
+        knownEnclosure[key] = result;
+        return result;
+    }
+
+    private bool buried(BlockPos position)
+    {
+        if (onChunkEdge(position.X, position.InternalY, position.Z)) return false;
+        ringPos.Set(position);
+        foreach (BlockFacing face in BlockFacing.ALLFACES)
+        {
+            face.IterateThruFacingOffsets(ringPos);
+            if (!enclosed(ringPos)) return false;
+        }
+        return true;
+    }
+
+    // A second-ring cell only needs resending when its hash could place a decoy there.
+    private bool mayShowDecoy(int id, BlockPos position)
+    {
+        int host = palette.Host[id];
+        return host != 0 && replacement(host, position.X, position.InternalY, position.Z) != host;
     }
 
     private int getBlock(BlockPos position)
@@ -206,6 +285,7 @@ public class BlockVisibility
         if (id < 0 || !config.ConcealOre) return id;
         lock (sync)
         {
+            knownEnclosure.Clear();
             ConnectedClient client = server.Clients[player.ClientId];
             BlockPos changed = new BlockPos(Dimensions.NormalWorld).SetAndCorrectDimension(x, y, z);
             invalidateAround(changed);
@@ -214,19 +294,30 @@ public class BlockVisibility
             {
                 face.IterateThruFacingOffsets(adjacent);
                 int actual = getBlock(adjacent);
-                if (actual < 0 || palette.Host[actual] == 0 || !didSend(client, adjacent)) continue;
-                server.SendPacket(player.ClientId, new Packet_Server {
-                    Id = Packet_ServerIdEnum.ExchangeBlock,
-                    ExchangeBlock = new Packet_ServerExchangeBlock {
-                        X = adjacent.X,
-                        Y = adjacent.InternalY,
-                        Z = adjacent.Z,
-                        BlockType = getView(actual, adjacent)
-                    }
-                });
+                if (actual >= 0 && palette.Host[actual] != 0) sendView(client, adjacent, actual);
+            }
+            foreach (var (dx, dy, dz) in secondRing)
+            {
+                adjacent.Set(changed).Add(dx, dy, dz);
+                int actual = getBlock(adjacent);
+                if (actual >= 0 && mayShowDecoy(actual, adjacent)) sendView(client, adjacent, actual);
             }
             return getView(id, changed);
         }
+    }
+
+    private void sendView(ConnectedClient client, BlockPos position, int actual)
+    {
+        if (!didSend(client, position)) return;
+        server.SendPacket(client.Id, new Packet_Server {
+            Id = Packet_ServerIdEnum.ExchangeBlock,
+            ExchangeBlock = new Packet_ServerExchangeBlock {
+                X = position.X,
+                Y = position.InternalY,
+                Z = position.Z,
+                BlockType = getView(actual, position)
+            }
+        });
     }
 
     public void SendUpdates(List<BlockPos> positions, int packetId)
@@ -235,6 +326,7 @@ public class BlockVisibility
         {
             for (int start = 0; start < positions.Count; start += updateBatchSize)
             {
+                knownEnclosure.Clear();
                 Dictionary<(int X, int Y, int Z), HashSet<BlockPos>> groups = [];
                 int end = Math.Min(start + updateBatchSize, positions.Count);
                 for (int i = start; i < end; i++)
@@ -248,6 +340,12 @@ public class BlockVisibility
                         face.IterateThruFacingOffsets(adjacent);
                         int id = getBlock(adjacent);
                         if (id >= 0 && palette.Host[id] != 0) addUpdate(groups, adjacent.Copy());
+                    }
+                    foreach (var (dx, dy, dz) in secondRing)
+                    {
+                        adjacent.Set(changed).Add(dx, dy, dz);
+                        int id = getBlock(adjacent);
+                        if (id >= 0 && mayShowDecoy(id, adjacent)) addUpdate(groups, adjacent.Copy());
                     }
                 }
 
@@ -307,6 +405,28 @@ public class BlockVisibility
             face.IterateThruFacingOffsets(pos);
             invalidate(pos.X >> chunkBits, pos.InternalY >> chunkBits, pos.Z >> chunkBits);
         }
+        foreach (var (dx, dy, dz) in secondRing)
+        {
+            pos.Set(position).Add(dx, dy, dz);
+            invalidate(pos.X >> chunkBits, pos.InternalY >> chunkBits, pos.Z >> chunkBits);
+        }
+    }
+
+    private static (int X, int Y, int Z)[] buildSecondRing()
+    {
+        const int distance = 2;
+        List<(int X, int Y, int Z)> ring = [];
+        for (int dy = -distance; dy <= distance; dy++)
+        {
+            for (int dz = -distance; dz <= distance; dz++)
+            {
+                for (int dx = -distance; dx <= distance; dx++)
+                {
+                    if (Math.Abs(dx) + Math.Abs(dy) + Math.Abs(dz) == distance) ring.Add((dx, dy, dz));
+                }
+            }
+        }
+        return [.. ring];
     }
 
     private void invalidate(int x, int y, int z)
