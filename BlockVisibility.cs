@@ -29,6 +29,7 @@ public class BlockVisibility
     private readonly int salt = RandomNumberGenerator.GetInt32(int.MaxValue);
     private readonly object sync = new();
     private readonly int[] source = new int[chunkVolume];
+    private readonly bool[] opaqueCells = new bool[chunkVolume];
     private readonly bool[] enclosedCells = new bool[chunkVolume];
     private readonly int[] compressionBuffer = new int[ChunkDataLayer.DATASLICES * ChunkDataLayer.SLICESIZE];
     private readonly ChunkDataPool pool;
@@ -37,8 +38,18 @@ public class BlockVisibility
     private readonly BlockPos pos = new(Dimensions.NormalWorld);
     private readonly BlockPos neighborPos = new(Dimensions.NormalWorld);
     private readonly BlockPos ringPos = new(Dimensions.NormalWorld);
+    private readonly BlockPos changedPos = new(Dimensions.NormalWorld);
+    private readonly BlockPos adjacentPos = new(Dimensions.NormalWorld);
+    private readonly BlockPos seamPos = new(Dimensions.NormalWorld);
     // Only valid for one resend. Block changes that bypass these hooks would leave it stale.
     private readonly Dictionary<(int X, int Y, int Z), bool> knownEnclosure = [];
+    // The loading column's face layer, with one extra row above and below, and the layer behind it.
+    private readonly bool[] seamOpening = new bool[(chunkSize + 2) * chunkSize];
+    private readonly bool[] seamOpeningDeep = new bool[chunkSize * chunkSize];
+    private readonly List<BlockPos> seamCells = [];
+    private readonly List<int> seamViews = [];
+    // Set while computing what a client was sent before this column loaded, when its reads came back missing.
+    private (int X, int Z, int MinY, int MaxY)? hiddenColumn;
     private readonly Dictionary<(int X, int Y, int Z), LinkedListNode<CacheEntry>> cache = [];
     private readonly LinkedList<CacheEntry> cacheOrder = [];
     private readonly Action<int[], byte[], byte[], int> unpack;
@@ -97,11 +108,11 @@ public class BlockVisibility
 
             unpack(source, packet.Blocks, packet.LightSat, packet.Compver);
             bool hasHost = false;
-            foreach (int id in source)
+            for (int i = 0; i < chunkVolume; i++)
             {
-                if (palette.Host[id] == 0) continue;
-                hasHost = true;
-                break;
+                int id = source[i];
+                opaqueCells[i] = palette.Opaque[id];
+                if (palette.Host[id] != 0) hasHost = true;
             }
             if (!hasHost)
             {
@@ -128,7 +139,7 @@ public class BlockVisibility
                         for (int x = 0; x < chunkSize; x++)
                         {
                             int index = (y * chunkSize + z) * chunkSize + x;
-                            enclosedCells[index] = palette.IsOpaque(source[index]) && enclosed(x, y, z);
+                            enclosedCells[index] = opaqueCells[index] && enclosed(x, y, z);
                         }
                     }
                 }
@@ -168,12 +179,18 @@ public class BlockVisibility
 
     private bool enclosed(int x, int y, int z)
     {
-        return palette.IsOpaque(read(x - 1, y, z))
-            && palette.IsOpaque(read(x + 1, y, z))
-            && palette.IsOpaque(read(x, y - 1, z))
-            && palette.IsOpaque(read(x, y + 1, z))
-            && palette.IsOpaque(read(x, y, z - 1))
-            && palette.IsOpaque(read(x, y, z + 1));
+        return opaqueAt(x - 1, y, z)
+            && opaqueAt(x + 1, y, z)
+            && opaqueAt(x, y - 1, z)
+            && opaqueAt(x, y + 1, z)
+            && opaqueAt(x, y, z - 1)
+            && opaqueAt(x, y, z + 1);
+    }
+
+    private bool opaqueAt(int x, int y, int z)
+    {
+        if ((uint)x < chunkSize && (uint)y < chunkSize && (uint)z < chunkSize) return opaqueCells[(y * chunkSize + z) * chunkSize + x];
+        return palette.IsOpaque(readNeighbor(x, y, z));
     }
 
     // Decoys stay at least two layers from any exposed face.
@@ -204,14 +221,13 @@ public class BlockVisibility
         return edgeX ? edgeY || edgeZ : edgeY && edgeZ;
     }
 
-    // Only reaches the six face-adjacent chunks, which onChunkEdge guarantees is enough.
-    private int read(int x, int y, int z)
+    // Reads a cell outside the chunk from one of the six face-adjacent chunks, which onChunkEdge guarantees is enough.
+    private int readNeighbor(int x, int y, int z)
     {
         BlockFacing face;
         if ((uint)x >= chunkSize) face = x < 0 ? BlockFacing.WEST : BlockFacing.EAST;
         else if ((uint)y >= chunkSize) face = y < 0 ? BlockFacing.DOWN : BlockFacing.UP;
-        else if ((uint)z >= chunkSize) face = z < 0 ? BlockFacing.NORTH : BlockFacing.SOUTH;
-        else return source[(y * chunkSize + z) * chunkSize + x];
+        else face = z < 0 ? BlockFacing.NORTH : BlockFacing.SOUTH;
         IWorldChunk? chunk = neighbors[face.Index];
         if (chunk == null || chunk.Disposed) return -1;
         return chunk.UnpackAndReadBlock(((y & chunkMask) * chunkSize + (z & chunkMask)) * chunkSize + (x & chunkMask), BlockLayersAccess.Solid);
@@ -274,7 +290,11 @@ public class BlockVisibility
 
     private int getBlock(BlockPos position)
     {
-        IWorldChunk? chunk = server.BlockAccessor.GetChunk(position.X >> chunkBits, position.InternalY >> chunkBits, position.Z >> chunkBits);
+        int chunkX = position.X >> chunkBits;
+        int chunkY = position.InternalY >> chunkBits;
+        int chunkZ = position.Z >> chunkBits;
+        if (hiddenColumn is { } hidden && chunkX == hidden.X && chunkZ == hidden.Z && chunkY >= hidden.MinY && chunkY < hidden.MaxY) return -1;
+        IWorldChunk? chunk = server.BlockAccessor.GetChunk(chunkX, chunkY, chunkZ);
         if (chunk == null || chunk.Disposed) return -1;
         return chunk.UnpackAndReadBlock(((position.Y & chunkMask) * chunkSize + (position.Z & chunkMask)) * chunkSize + (position.X & chunkMask), BlockLayersAccess.Solid);
     }
@@ -287,9 +307,9 @@ public class BlockVisibility
         {
             knownEnclosure.Clear();
             ConnectedClient client = server.Clients[player.ClientId];
-            BlockPos changed = new BlockPos(Dimensions.NormalWorld).SetAndCorrectDimension(x, y, z);
+            BlockPos changed = changedPos.SetAndCorrectDimension(x, y, z);
             invalidateAround(changed);
-            BlockPos adjacent = changed.Copy();
+            BlockPos adjacent = adjacentPos.Set(changed);
             foreach (BlockFacing face in BlockFacing.ALLFACES)
             {
                 face.IterateThruFacingOffsets(adjacent);
@@ -334,7 +354,7 @@ public class BlockVisibility
                     BlockPos changed = positions[i];
                     invalidateAround(changed);
                     addUpdate(groups, changed);
-                    BlockPos adjacent = changed.Copy();
+                    BlockPos adjacent = adjacentPos.Set(changed);
                     foreach (BlockFacing face in BlockFacing.ALLFACES)
                     {
                         face.IterateThruFacingOffsets(adjacent);
@@ -348,22 +368,26 @@ public class BlockVisibility
                         if (id >= 0 && mayShowDecoy(id, adjacent)) addUpdate(groups, adjacent.Copy());
                     }
                 }
-
-                foreach (var group in groups)
-                {
-                    BlockPos[] updates = [.. group.Value];
-                    Packet_ServerSetBlocks blocks = new();
-                    blocks.SetSetBlocks(packUpdates(updates));
-                    Packet_Server packet = new() { Id = packetId, SetBlocks = blocks };
-                    foreach (ConnectedClient client in server.Clients.Values)
-                    {
-                        if (client.Player == null || !client.State.ConnectedOrPlaying() || !didSend(client, updates[0])) continue;
-                        server.SendPacket(client.Id, packet);
-                    }
-                }
+                sendGroups(groups, packetId);
             }
         }
         ServerMain.FrameProfiler.Mark("serverguard-blockupdates");
+    }
+
+    private void sendGroups(Dictionary<(int X, int Y, int Z), HashSet<BlockPos>> groups, int packetId)
+    {
+        foreach (var group in groups)
+        {
+            BlockPos[] updates = [.. group.Value];
+            Packet_ServerSetBlocks blocks = new();
+            blocks.SetSetBlocks(packUpdates(updates));
+            Packet_Server packet = new() { Id = packetId, SetBlocks = blocks };
+            foreach (ConnectedClient client in server.Clients.Values)
+            {
+                if (client.Player == null || !client.State.ConnectedOrPlaying() || !didSend(client, updates[0])) continue;
+                server.SendPacket(client.Id, packet);
+            }
+        }
     }
 
     private static void addUpdate(Dictionary<(int X, int Y, int Z), HashSet<BlockPos>> groups, BlockPos position)
@@ -453,21 +477,107 @@ public class BlockVisibility
         if (!config.ConcealOre || server.ShuttingDown) return;
         lock (sync)
         {
-            for (int y = 0; y < request.Chunks.Length; y++)
+            int minY = dimension * GlobalConstants.DimensionSizeInChunks;
+            int maxY = minY + request.Chunks.Length;
+            Dictionary<(int X, int Y, int Z), HashSet<BlockPos>> groups = [];
+            for (int chunkY = minY; chunkY < maxY; chunkY++)
             {
-                int chunkY = y + dimension * GlobalConstants.DimensionSizeInChunks;
                 invalidate(request.ChunkX, chunkY, request.ChunkZ);
                 foreach (BlockFacing face in BlockFacing.HORIZONTALS)
                 {
                     pos.SetAndCorrectDimension(request.ChunkX, chunkY, request.ChunkZ).Add(face);
                     invalidate(pos.X, pos.InternalY, pos.Z);
-                    long index = server.WorldMap.ChunkIndex3D(pos.X, pos.InternalY, pos.Z);
-                    foreach (ConnectedClient client in server.Clients.Values)
-                    {
-                        if (client.DidSendChunk(index)) client.forceSendChunks.Add(index);
-                    }
+                    if (anySent(server.WorldMap.ChunkIndex3D(pos.X, pos.InternalY, pos.Z))) addSeam(groups, request.ChunkX, chunkY, request.ChunkZ, face, minY, maxY);
+                }
+            }
+            sendGroups(groups, Packet_ServerIdEnum.SetBlocksNoRelight);
+        }
+    }
+
+    private bool anySent(long chunkIndex)
+    {
+        foreach (ConnectedClient client in server.Clients.Values)
+        {
+            if (client.DidSendChunk(chunkIndex)) return true;
+        }
+        return false;
+    }
+
+    private void addSeam(Dictionary<(int X, int Y, int Z), HashSet<BlockPos>> groups, int columnX, int chunkY, int columnZ, BlockFacing face, int minY, int maxY)
+    {
+        bool alongX = face.Axis == EnumAxis.X;
+        int step = alongX ? face.Normali.X : face.Normali.Z;
+        int columnEdge = (alongX ? columnX : columnZ) * chunkSize + (step > 0 ? chunkMask : 0);
+        int baseU = (alongX ? columnZ : columnX) * chunkSize;
+        int baseY = chunkY * chunkSize;
+        bool anyOpening = false;
+        for (int v = -1; v <= chunkSize; v++)
+        {
+            for (int u = 0; u < chunkSize; u++)
+            {
+                bool open = !palette.IsOpaque(getBlock(seamCell(alongX, columnEdge, baseU + u, baseY + v)));
+                seamOpening[(v + 1) * chunkSize + u] = open;
+                anyOpening |= open;
+            }
+        }
+        for (int v = 0; v < chunkSize; v++)
+        {
+            for (int u = 0; u < chunkSize; u++)
+            {
+                bool open = !palette.IsOpaque(getBlock(seamCell(alongX, columnEdge - step, baseU + u, baseY + v)));
+                seamOpeningDeep[v * chunkSize + u] = open;
+                anyOpening |= open;
+            }
+        }
+        if (!anyOpening) return;
+
+        seamCells.Clear();
+        for (int depth = 0; depth < 2; depth++)
+        {
+            for (int v = 0; v < chunkSize; v++)
+            {
+                for (int u = 0; u < chunkSize; u++)
+                {
+                    if (!nearOpening(u, v, depth)) continue;
+                    BlockPos cell = seamCell(alongX, columnEdge + step * (depth + 1), baseU + u, baseY + v);
+                    int id = getBlock(cell);
+                    if (id >= 0 && palette.Host[id] != 0) seamCells.Add(cell.Copy());
                 }
             }
         }
+        if (seamCells.Count == 0) return;
+
+        seamViews.Clear();
+        knownEnclosure.Clear();
+        hiddenColumn = (columnX, columnZ, minY, maxY);
+        try
+        {
+            foreach (BlockPos cell in seamCells) seamViews.Add(getView(getBlock(cell), cell));
+        }
+        finally
+        {
+            hiddenColumn = null;
+            knownEnclosure.Clear();
+        }
+        for (int i = 0; i < seamCells.Count; i++)
+        {
+            BlockPos cell = seamCells[i];
+            if (getView(getBlock(cell), cell) != seamViews[i]) addUpdate(groups, cell);
+        }
     }
+
+    // Cells beside a seam cell along the seam belong to other columns, which this load does not change.
+    private bool nearOpening(int u, int v, int depth)
+    {
+        int row = (v + 1) * chunkSize + u;
+        if (seamOpening[row]) return true;
+        if (depth == 1) return false;
+        return seamOpeningDeep[v * chunkSize + u]
+            || seamOpening[row - chunkSize]
+            || seamOpening[row + chunkSize]
+            || (u > 0 && seamOpening[row - 1])
+            || (u < chunkMask && seamOpening[row + 1]);
+    }
+
+    private BlockPos seamCell(bool alongX, int along, int u, int y) => alongX ? seamPos.SetAndCorrectDimension(along, y, u) : seamPos.SetAndCorrectDimension(u, y, along);
 }

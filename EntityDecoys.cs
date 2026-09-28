@@ -14,6 +14,9 @@ namespace ServerGuard;
 public class EntityDecoys : IDisposable
 {
     private const int intervalMs = 250;
+    private const int recheckMs = 500;
+    private const double recheckMoveSq = 0.25 * 0.25;
+    private const int searchesPerTick = 4;
     private const int searchColumns = 4;
     private const int searchDepth = 32;
     private const int maxRange = 80;
@@ -34,6 +37,8 @@ public class EntityDecoys : IDisposable
     private readonly BlockPos spacePos = new(Dimensions.NormalWorld);
     private readonly long listenerId;
     private readonly int minRange;
+    private EntityAgent? probe;
+    private int searchCursor;
 
     public int ActiveCount { get; private set; }
     public long Spawned { get; private set; }
@@ -59,6 +64,8 @@ public class EntityDecoys : IDisposable
         public readonly Template Template = template;
         public readonly long Expires = expires;
         public long NextPosition;
+        public long NextCheck;
+        public double EyeX, EyeY, EyeZ;
         public int Tick;
     }
 
@@ -134,11 +141,16 @@ public class EntityDecoys : IDisposable
             }
         }
         foreach (ConnectedClient client in disconnected) clients.Remove(client);
-        foreach (ConnectedClient client in connected)
+        foreach (ConnectedClient client in connected) refresh(client, clients[client], now);
+        int searches = 0;
+        for (int visited = 0; visited < connected.Count && searches < searchesPerTick && ActiveCount < config.EntityDecoysGlobalCap; visited++)
         {
+            if (searchCursor >= connected.Count) searchCursor = 0;
+            ConnectedClient client = connected[searchCursor++];
             List<Decoy> decoys = clients[client];
-            refresh(client, decoys, now);
-            if (ActiveCount < config.EntityDecoysGlobalCap && decoys.Count < config.EntityDecoysPerPlayer) trySpawn(client, decoys, now);
+            if (decoys.Count >= config.EntityDecoysPerPlayer) continue;
+            trySpawn(client, decoys, now);
+            searches++;
         }
         ServerMain.FrameProfiler.Mark("serverguard-decoys");
     }
@@ -146,12 +158,15 @@ public class EntityDecoys : IDisposable
     private void refresh(ConnectedClient client, List<Decoy> decoys, long now)
     {
         despawns.Clear();
+        EntityPlayer viewer = client.Entityplayer;
+        double eyeX = viewer.Pos.X + viewer.LocalEyePos.X;
+        double eyeY = viewer.Pos.InternalY + viewer.LocalEyePos.Y;
+        double eyeZ = viewer.Pos.Z + viewer.LocalEyePos.Z;
         for (int i = decoys.Count - 1; i >= 0; i--)
         {
             Decoy decoy = decoys[i];
             EntityAgent entity = decoy.Entity;
-            scratch.SetAndCorrectDimension((int)Math.Floor(entity.Pos.X), (int)Math.Floor(entity.Pos.InternalY), (int)Math.Floor(entity.Pos.Z));
-            if (now >= decoy.Expires || !inRange(client, entity.Pos) || !hasSpace(client, scratch, decoy.Template) || visibility.CanSeeDecoy(client, entity))
+            if (now >= decoy.Expires || !inRange(client, entity.Pos) || (needsCheck(decoy, now, eyeX, eyeY, eyeZ) && !stillHidden(client, decoy, now, eyeX, eyeY, eyeZ)))
             {
                 despawns.Add(new EntityDespawn { EntityId = entity.EntityId, DespawnData = new EntityDespawnData { Reason = EnumDespawnReason.OutOfRange } });
                 decoys.RemoveAt(i);
@@ -168,6 +183,32 @@ public class EntityDecoys : IDisposable
             });
         }
         sendDespawns(client);
+    }
+
+    private static bool needsCheck(Decoy decoy, long now, double eyeX, double eyeY, double eyeZ)
+    {
+        if (now >= decoy.NextCheck) return true;
+        double dx = eyeX - decoy.EyeX;
+        double dy = eyeY - decoy.EyeY;
+        double dz = eyeZ - decoy.EyeZ;
+        return dx * dx + dy * dy + dz * dz > recheckMoveSq;
+    }
+
+    private bool stillHidden(ConnectedClient client, Decoy decoy, long now, double eyeX, double eyeY, double eyeZ)
+    {
+        EntityAgent entity = decoy.Entity;
+        scratch.SetAndCorrectDimension((int)Math.Floor(entity.Pos.X), (int)Math.Floor(entity.Pos.InternalY), (int)Math.Floor(entity.Pos.Z));
+        if (!hasSpace(client, scratch, decoy.Template) || visibility.CanSeeDecoy(client, entity)) return false;
+        markChecked(decoy, now, eyeX, eyeY, eyeZ);
+        return true;
+    }
+
+    private static void markChecked(Decoy decoy, long now, double eyeX, double eyeY, double eyeZ)
+    {
+        decoy.NextCheck = now + recheckMs;
+        decoy.EyeX = eyeX;
+        decoy.EyeY = eyeY;
+        decoy.EyeZ = eyeZ;
     }
 
     private bool inRange(ConnectedClient client, EntityPos position)
@@ -211,6 +252,37 @@ public class EntityDecoys : IDisposable
     {
         Random random = api.World.Rand;
         Template template = templates[random.Next(templates.Count)];
+        // Most searches find no spot, so they test positions with one reused entity.
+        EntityAgent candidate = probe ??= createEntity(template);
+        candidate.SelectionBox = template.Bounds;
+        EntityPlayer viewer = client.Entityplayer;
+        candidate.Pos.Dimension = viewer.Pos.Dimension;
+        for (int column = 0; column < searchColumns; column++)
+        {
+            double angle = random.NextDouble() * Math.PI * 2;
+            double radius = minRange + 4 + random.NextDouble() * (maxRange - minRange - 4);
+            int x = (int)Math.Floor(viewer.Pos.X + Math.Cos(angle) * radius);
+            int z = (int)Math.Floor(viewer.Pos.Z + Math.Sin(angle) * radius);
+            for (int depth = 0; depth < searchDepth; depth++)
+            {
+                scratch.Set(x, (int)Math.Floor(viewer.Pos.Y) + 8 - depth, z);
+                scratch.dimension = viewer.Pos.Dimension;
+                candidate.Pos.SetPos(x + 0.5, scratch.Y, z + 0.5);
+                if (!inRange(client, candidate.Pos) || !hasSpace(client, scratch, template) || visibility.CanSeeDecoy(client, candidate)) continue;
+                bool occupied = false;
+                foreach (Decoy existing in decoys)
+                {
+                    if (existing.Entity.Pos.SquareDistanceTo(candidate.Pos) < 9) occupied = true;
+                }
+                if (occupied) break;
+                spawn(client, decoys, template, candidate.Pos, now);
+                return;
+            }
+        }
+    }
+
+    private EntityAgent createEntity(Template template)
+    {
         var properties = template.Properties;
         // A serialization-only instance avoids registering server AI, physics, or behavior callbacks.
         if (api.ClassRegistry.CreateEntity(properties) is not EntityAgent entity || entity is EntityPlayer) throw new InvalidOperationException($"Unsupported decoy class for {properties.Code}.");
@@ -219,43 +291,32 @@ public class EntityDecoys : IDisposable
         entity.Code = properties.Code;
         entity.Tags = properties.Tags;
         entity.SelectionBox = template.Bounds;
-        var viewer = client.Entityplayer.Pos;
-        entity.Pos.Dimension = viewer.Dimension;
-        for (int column = 0; column < searchColumns; column++)
-        {
-            double angle = random.NextDouble() * Math.PI * 2;
-            double radius = minRange + 4 + random.NextDouble() * (maxRange - minRange - 4);
-            int x = (int)Math.Floor(viewer.X + Math.Cos(angle) * radius);
-            int z = (int)Math.Floor(viewer.Z + Math.Sin(angle) * radius);
-            for (int depth = 0; depth < searchDepth; depth++)
-            {
-                scratch.Set(x, (int)Math.Floor(viewer.Y) + 8 - depth, z);
-                scratch.dimension = viewer.Dimension;
-                entity.Pos.SetPos(x + 0.5, scratch.Y, z + 0.5);
-                if (!inRange(client, entity.Pos) || !hasSpace(client, scratch, template) || visibility.CanSeeDecoy(client, entity)) continue;
-                bool occupied = false;
-                foreach (Decoy existing in decoys)
-                {
-                    if (existing.Entity.Pos.SquareDistanceTo(entity.Pos) < 9) occupied = true;
-                }
-                if (occupied) break;
-                // Reserve IDs from the native main-thread allocator without spawning into the world.
-                entity.EntityId = ++((SaveGame)api.WorldManager.SaveGame).LastEntityId;
-                entity.Pos.Yaw = (float)(random.NextDouble() * Math.PI * 2);
-                entity.PositionBeforeFalling.Set(entity.Pos.X, entity.Pos.Y, entity.Pos.Z);
-                entity.WatchedAttributes.SetAttribute("health", template.Health.Clone());
-                entity.WatchedAttributes.SetInt("textureIndex", random.Next(properties.Client.TexturesAlternatesCount + 1));
-                Packet_Entity packet = ServerPackets.GetEntityPacket(entity);
-                decoys.Add(new Decoy(entity, template, now + random.Next(30000, 60001)));
-                ActiveCount++;
-                Spawned++;
-                server.SendPacket(client.Id, new Packet_Server {
-                    Id = Packet_ServerIdEnum.EntitySpawn,
-                    EntitySpawn = new Packet_EntitySpawn { Entity = [packet], EntityCount = 1, EntityLength = 1 }
-                });
-                return;
-            }
-        }
+        return entity;
+    }
+
+    private void spawn(ConnectedClient client, List<Decoy> decoys, Template template, EntityPos position, long now)
+    {
+        Random random = api.World.Rand;
+        EntityAgent entity = createEntity(template);
+        entity.Pos.Dimension = position.Dimension;
+        entity.Pos.SetPos(position.X, position.Y, position.Z);
+        // Reserve IDs from the native main-thread allocator without spawning into the world.
+        entity.EntityId = ++((SaveGame)api.WorldManager.SaveGame).LastEntityId;
+        entity.Pos.Yaw = (float)(random.NextDouble() * Math.PI * 2);
+        entity.PositionBeforeFalling.Set(entity.Pos.X, entity.Pos.Y, entity.Pos.Z);
+        entity.WatchedAttributes.SetAttribute("health", template.Health.Clone());
+        entity.WatchedAttributes.SetInt("textureIndex", random.Next(template.Properties.Client.TexturesAlternatesCount + 1));
+        Packet_Entity packet = ServerPackets.GetEntityPacket(entity);
+        Decoy decoy = new(entity, template, now + random.Next(30000, 60001));
+        EntityPlayer viewer = client.Entityplayer;
+        markChecked(decoy, now, viewer.Pos.X + viewer.LocalEyePos.X, viewer.Pos.InternalY + viewer.LocalEyePos.Y, viewer.Pos.Z + viewer.LocalEyePos.Z);
+        decoys.Add(decoy);
+        ActiveCount++;
+        Spawned++;
+        server.SendPacket(client.Id, new Packet_Server {
+            Id = Packet_ServerIdEnum.EntitySpawn,
+            EntitySpawn = new Packet_EntitySpawn { Entity = [packet], EntityCount = 1, EntityLength = 1 }
+        });
     }
 
     private void despawnAll(ConnectedClient client, List<Decoy> decoys)

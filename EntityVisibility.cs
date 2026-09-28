@@ -12,6 +12,10 @@ namespace ServerGuard;
 public class EntityVisibility : IDisposable
 {
     private const int visibilityIntervalMs = 200;
+    private const int sightingEpochs = 4;
+    private const int sightingEpochSpread = 3;
+    private const double sightingMoveSq = 0.25 * 0.25;
+    private const int maxSightings = 1 << 14;
     private const int boundsCorners = 1 << 3;
     private const int samplesPerEntity = 1 + boundsCorners;
     private const double boundsMargin = 0.25;
@@ -31,10 +35,22 @@ public class EntityVisibility : IDisposable
         public readonly AABBIntersectionTest Raycaster = new(new OcclusionSupplier(server));
         public readonly Ray Ray = new();
         public readonly BlockFilter Filter = (pos, block) => palette.Opaque[block.Id];
-        public readonly Dictionary<(int ClientId, long EntityId), bool> Visible = [];
+        public readonly Dictionary<(int ClientId, long EntityId), Sighting> Visible = [];
         public long Epoch = -1;
         public int Remaining;
         public int DecoyRemaining;
+    }
+
+    private readonly record struct Sighting(bool Visible, long Epoch, double EyeX, double EyeY, double EyeZ, double X, double Y, double Z)
+    {
+        public bool StillHolds(long epoch, long entityId, double eyeX, double eyeY, double eyeZ, EntityPos pos)
+        {
+            if (epoch == Epoch) return true;
+            if (epoch - Epoch >= sightingEpochs + (long)((ulong)entityId % sightingEpochSpread)) return false;
+            return lengthSq(eyeX - EyeX, eyeY - EyeY, eyeZ - EyeZ) <= sightingMoveSq && lengthSq(pos.X - X, pos.InternalY - Y, pos.Z - Z) <= sightingMoveSq;
+        }
+
+        private static double lengthSq(double x, double y, double z) => x * x + y * y + z * z;
     }
 
     private sealed class OcclusionSupplier(IWorldIntersectionSupplier world) : IWorldIntersectionSupplier
@@ -84,11 +100,13 @@ public class EntityVisibility : IDisposable
             worker.Epoch = epoch;
             worker.Remaining = config.EntityRayBudgetPerThread;
             worker.DecoyRemaining = config.DecoyRayBudgetPerThread;
-            worker.Visible.Clear();
+            if (worker.Visible.Count > maxSightings) worker.Visible.Clear();
         }
+        double eyeX = viewer.Pos.X + viewer.LocalEyePos.X;
+        double eyeY = viewer.Pos.InternalY + viewer.LocalEyePos.Y;
+        double eyeZ = viewer.Pos.Z + viewer.LocalEyePos.Z;
         var key = (client.Id, entity.EntityId);
-        bool visible;
-        if (useCache && worker.Visible.TryGetValue(key, out visible)) return visible;
+        if (useCache && worker.Visible.TryGetValue(key, out Sighting seen) && seen.StillHolds(epoch, entity.EntityId, eyeX, eyeY, eyeZ, entity.Pos)) return seen.Visible;
         ref int remaining = ref (decoy ? ref worker.DecoyRemaining : ref worker.Remaining);
         if (remaining < samplesPerEntity)
         {
@@ -97,9 +115,8 @@ public class EntityVisibility : IDisposable
             return decoy;
         }
 
-        var origin = worker.Ray.origin;
-        origin.Set(viewer.Pos.X + viewer.LocalEyePos.X, viewer.Pos.InternalY + viewer.LocalEyePos.Y, viewer.Pos.Z + viewer.LocalEyePos.Z);
-        visible = clearRay(worker, ref remaining, entity.Pos.X + box.MidX, entity.Pos.InternalY + box.MidY, entity.Pos.Z + box.MidZ);
+        worker.Ray.origin.Set(eyeX, eyeY, eyeZ);
+        bool visible = clearRay(worker, ref remaining, entity.Pos.X + box.MidX, entity.Pos.InternalY + box.MidY, entity.Pos.Z + box.MidZ);
         for (int corner = 0; corner < boundsCorners && !visible; corner++)
         {
             double x = (corner & 1) == 0 ? box.X1 - boundsMargin : box.X2 + boundsMargin;
@@ -107,7 +124,7 @@ public class EntityVisibility : IDisposable
             double z = (corner & 4) == 0 ? box.Z1 - boundsMargin : box.Z2 + boundsMargin;
             visible = clearRay(worker, ref remaining, entity.Pos.X + x, entity.Pos.InternalY + y, entity.Pos.Z + z);
         }
-        if (useCache) worker.Visible[key] = visible;
+        if (useCache) worker.Visible[key] = new Sighting(visible, epoch, eyeX, eyeY, eyeZ, entity.Pos.X, entity.Pos.InternalY, entity.Pos.Z);
         if (!visible) Interlocked.Increment(ref concealed);
         return visible;
     }

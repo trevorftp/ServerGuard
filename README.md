@@ -31,13 +31,13 @@ Optional [Integrated Mod Manager (IMM)](https://mods.vintagestory.at/imm) suppor
 - **EntityRayBudgetPerThread: 512**  
   Real-entity visibility raycasts allowed per thread every 200 ms. Accepts 16 to 16384.
 
-- **DecoyRayBudgetPerThread: 4096**  
+- **DecoyRayBudgetPerThread: 1024**  
   Decoy visibility raycasts allowed per thread every 200 ms, separate from the real-entity allowance above and unable to spend it. Accepts 16 to 16384.
 
-- **EntityDecoysPerPlayer: 32**  
+- **EntityDecoysPerPlayer: 12**  
   Target creature decoys per player. Accepts 0 to 128. Set to 0 to disable.
 
-- **EntityDecoysGlobalCap: 512**  
+- **EntityDecoysGlobalCap: 256**  
   Total creature decoys allowed across all players at once. Accepts 0 to 4096.
 
 - **ConcealPlayerInventory: true**  

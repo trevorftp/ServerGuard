@@ -11,9 +11,9 @@ public class ServerGuardConfig
     public bool ConcealPlayers = false;
     public int AlwaysVisibleRange = 16;
     public int EntityRayBudgetPerThread = 512;
-    public int EntityDecoysPerPlayer = 32;
-    public int EntityDecoysGlobalCap = 512;
-    public int DecoyRayBudgetPerThread = 4096;
+    public int EntityDecoysPerPlayer = 12;
+    public int EntityDecoysGlobalCap = 256;
+    public int DecoyRayBudgetPerThread = 1024;
     public bool ConcealPlayerInventory = true;
     public bool ConcealContainers = true;
 
